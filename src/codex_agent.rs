@@ -1,14 +1,14 @@
 use agent_client_protocol::{
     Agent, AgentAuthCapabilities, AgentCapabilities, AuthEnvVar, AuthMethod, AuthMethodAgent,
     AuthMethodEnvVar, AuthMethodId, AuthenticateRequest, AuthenticateResponse, CancelNotification,
-    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Error, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, LogoutCapabilities, LogoutRequest, LogoutResponse,
-    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion,
-    SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
+    ClientCapabilities, CloseSessionRequest, CloseSessionResponse, ContentBlock, Error,
+    ExtNotification, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, LogoutCapabilities,
+    LogoutRequest, LogoutResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
+    ProtocolVersion, SessionCapabilities, SessionCloseCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
@@ -30,6 +30,7 @@ use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
 };
+use serde::Deserialize;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -236,6 +237,13 @@ impl Agent for CodexAgent {
         agent_capabilities.session_capabilities = SessionCapabilities::new()
             .close(SessionCloseCapabilities::new())
             .list(SessionListCapabilities::new());
+
+        // Advertise support for the `session/steer` extension notification.
+        // Clients that also advertise support can inject additional user input
+        // into an active turn without opening a second `session/prompt` channel.
+        let mut meta = serde_json::Map::new();
+        meta.insert("steer".to_string(), serde_json::Value::Bool(true));
+        agent_capabilities.meta = Some(meta);
 
         let mut auth_methods = vec![
             CodexAuthMethod::ChatGpt.into(),
@@ -544,6 +552,31 @@ impl Agent for CodexAgent {
     async fn cancel(&self, args: CancelNotification) -> Result<(), Error> {
         info!("Cancelling operations for session: {}", args.session_id);
         self.get_thread(&args.session_id)?.cancel().await?;
+        Ok(())
+    }
+
+    /// Handle extension notifications. Currently supports `session/steer` for
+    /// mid-turn user-input injection.
+    async fn ext_notification(&self, args: ExtNotification) -> Result<(), Error> {
+        let method = args.method.as_ref();
+        if method != "session/steer" {
+            return Ok(());
+        }
+
+        #[derive(Deserialize)]
+        struct SteerParams {
+            #[serde(rename = "sessionId")]
+            session_id: String,
+            prompt: Vec<ContentBlock>,
+        }
+
+        let params: SteerParams = serde_json::from_str(args.params.get()).map_err(|e| {
+            Error::invalid_params().data(format!("invalid session/steer params: {e}"))
+        })?;
+
+        let session_id = SessionId::new(params.session_id);
+        let thread = self.get_thread(&session_id)?;
+        thread.steer(params.prompt).await?;
         Ok(())
     }
 

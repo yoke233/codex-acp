@@ -23,7 +23,7 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    AuthManager, CodexThread,
+    AuthManager, CodexThread, SteerInputError,
     config::{Config, set_project_trust_level},
     error::CodexErr,
     models_manager::manager::{ModelsManager, RefreshStrategy},
@@ -84,6 +84,13 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 pub trait CodexThreadImpl {
     async fn submit(&self, op: Op) -> Result<String, CodexErr>;
     async fn next_event(&self) -> Result<Event, CodexErr>;
+    /// Inject additional user input into the currently active turn.
+    /// Returns the active turn id when accepted.
+    async fn steer_input(
+        &self,
+        input: Vec<UserInput>,
+        expected_turn_id: Option<&str>,
+    ) -> Result<String, SteerInputError>;
 }
 
 #[async_trait::async_trait]
@@ -94,6 +101,14 @@ impl CodexThreadImpl for CodexThread {
 
     async fn next_event(&self) -> Result<Event, CodexErr> {
         self.next_event().await
+    }
+
+    async fn steer_input(
+        &self,
+        input: Vec<UserInput>,
+        expected_turn_id: Option<&str>,
+    ) -> Result<String, SteerInputError> {
+        self.steer_input(input, expected_turn_id).await
     }
 }
 
@@ -152,6 +167,10 @@ enum ThreadMessage {
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     Cancel {
+        response_tx: oneshot::Sender<Result<(), Error>>,
+    },
+    Steer {
+        prompt: Vec<ContentBlock>,
         response_tx: oneshot::Sender<Result<(), Error>>,
     },
     Shutdown {
@@ -291,6 +310,22 @@ impl Thread {
         let (response_tx, response_rx) = oneshot::channel();
 
         let message = ThreadMessage::Cancel { response_tx };
+        drop(self.message_tx.send(message));
+
+        response_rx
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+    }
+
+    /// Inject additional user input into the currently active turn without
+    /// starting a new prompt turn. Mirrors Codex App Server's `turn/steer`.
+    pub async fn steer(&self, prompt: Vec<ContentBlock>) -> Result<(), Error> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let message = ThreadMessage::Steer {
+            prompt,
+            response_tx,
+        };
         drop(self.message_tx.send(message));
 
         response_rx
@@ -2719,6 +2754,13 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_cancel().await;
                 drop(response_tx.send(result));
             }
+            ThreadMessage::Steer {
+                prompt,
+                response_tx,
+            } => {
+                let result = self.handle_steer(prompt).await;
+                drop(response_tx.send(result));
+            }
             ThreadMessage::Shutdown { response_tx } => {
                 let result = self.handle_shutdown().await;
                 drop(response_tx.send(result));
@@ -3360,6 +3402,24 @@ impl<A: Auth> ThreadActor<A> {
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         Ok(())
+    }
+
+    async fn handle_steer(&mut self, prompt: Vec<ContentBlock>) -> Result<(), Error> {
+        let items = build_prompt_items(prompt);
+        if items.is_empty() {
+            return Err(Error::invalid_params().data("steer prompt is empty"));
+        }
+        match self.thread.steer_input(items, None).await {
+            Ok(turn_id) => {
+                info!("Steered active turn {turn_id}");
+                Ok(())
+            }
+            Err(SteerInputError::NoActiveTurn(_)) => {
+                warn!("session/steer ignored: no active turn");
+                Ok(())
+            }
+            Err(err) => Err(Error::internal_error().data(format!("steer failed: {err:?}"))),
+        }
     }
 
     async fn handle_shutdown(&mut self) -> Result<(), Error> {
@@ -4641,6 +4701,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CodexThreadImpl for StubCodexThread {
+        async fn steer_input(
+            &self,
+            _input: Vec<UserInput>,
+            _expected_turn_id: Option<&str>,
+        ) -> Result<String, SteerInputError> {
+            let id = self
+                .current_id
+                .load(std::sync::atomic::Ordering::SeqCst);
+            Ok(id.to_string())
+        }
+
         async fn submit(&self, op: Op) -> Result<String, CodexErr> {
             let id = self
                 .current_id
